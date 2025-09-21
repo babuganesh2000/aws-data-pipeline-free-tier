@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cost-optimized AWS Data Pipeline with RDS SQL Server and Kinesis'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  
+  MonthlyBudgetLimit:
+    Type: Number
+    Default: 45
+    Description: Monthly budget limit in USD
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+    Description: Password for SQL Server master user
+
+Resources:
+  # VPC Configuration
+  DataPipelineVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-data-pipeline-vpc"
+
+  # Private Subnets for RDS
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DataPipelineVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-private-subnet-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DataPipelineVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-private-subnet-2"
+
+  # RDS Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS SQL Server
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-db-subnet-group"
+
+  # Security Group for RDS
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS SQL Server
+      VpcId: !Ref DataPipelineVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1433
+          ToPort: 1433
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-rds-sg"
+
+  # Security Group for Lambda
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref DataPipelineVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-lambda-sg"
+
+  # RDS SQL Server Express (Free Tier Eligible)
+  SQLServerDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${Environment}-sqlserver-db"
+      DBInstanceClass: db.t3.micro
+      Engine: sqlserver-ex
+      EngineVersion: '15.00.4236.7.v1'
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBPassword
+      AllocatedStorage: 20
+      StorageType: gp2
+      VpcSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      BackupRetentionPeriod: 1
+      DeleteAutomatedBackups: true
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-sqlserver"
+        - Key: AutoShutdown
+          Value: "true"
+
+  # Kinesis Data Stream
+  DataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub "${Environment}-data-stream"
+      ShardCount: 1
+      RetentionPeriodHours: 24
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-kinesis-stream"
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/AmazonKinesisReadOnlyAccess
+      Policies:
+        - PolicyName: RDSManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:StopDBInstance
+                  - rds:StartDBInstance
+                Resource: '*'
+
+  # Budget for Cost Control
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${Environment}-data-pipeline-budget"
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetLimit
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters:
+          TagKey:
+            - Environment
+          TagValue:
+            - !Ref Environment
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref DataPipelineVPC
+    Export:
+      Name: !Sub "${Environment}-vpc-id"
+
+  KinesisStreamName:
+    Description: Kinesis Stream Name
+    Value: !Ref DataStream
+    Export:
+      Name: !Sub "${Environment}-kinesis-stream"
+
+  RDSEndpoint:
+    Description: RDS SQL Server Endpoint
+    Value: !GetAtt SQLServerDB.Endpoint.Address
+    Export:
+      Name: !Sub "${Environment}-rds-endpoint"
